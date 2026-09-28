@@ -251,6 +251,7 @@ def _redirect_everything_to(tmp_path, monkeypatch):
     for name in ("CSWAP_PIN_PORT", "CSWAP_PIN_WIRED", "CSWAP_PIN_FIFO",
                  "CSWAP_PIN_REFCOUNT_FD", "CSWAP_PIN_SELF_HEAL",
                  "CSWAP_PIN_DEBUG", "CSWAP_PIN_SHAPE", "CSWAP_PIN_SLOW_MS",
+                 "CSWAP_PIN_INFERENCE_FOLLOWS",
                  "CSWAP_PIN_LISTEN_FD", "CSWAP_PIN_LISTEN_FROM",
                  # Set BY a case that wants it, never inherited: a developer
                  # who exported it would make every holder in the suite die
