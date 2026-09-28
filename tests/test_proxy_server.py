@@ -12021,7 +12021,7 @@ class TestInferenceFollows:
             assert st == 200
             assert upstream.seen_auth == "Bearer PIN-TOKEN"
             proxy._inference_stats.flush()
-            stats = json.loads((certdir / "inference-follows.json").read_text())
+            stats = json.loads(proxy._inference_stats._path.read_text())
             assert stats["swapped"] == 1
             assert stats["entrypoints"] == ["claude-desktop"]
             assert stats["lastSwapAt"]
@@ -12057,7 +12057,7 @@ class TestInferenceFollows:
             assert st == 200
             assert upstream.seen_auth == "Bearer HOST-TOKEN"
             proxy._inference_stats.flush()
-            stats = json.loads((certdir / "inference-follows.json").read_text())
+            stats = json.loads(proxy._inference_stats._path.read_text())
             assert stats["retriedUnswapped"] == 1
             assert stats["lastRetryAt"]
         finally:
@@ -12083,7 +12083,7 @@ class TestInferenceFollows:
                                         "/v1/messages", bearer="ACTIVE",
                                         ua=_DESKTOP_UA)
             proxy._inference_stats.flush()
-            stats = json.loads((certdir / "inference-follows.json").read_text())
+            stats = json.loads(proxy._inference_stats._path.read_text())
             assert stats["swapped"] == 0
             assert stats["passthrough"]["expiring"] == 2
         finally:

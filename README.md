@@ -534,7 +534,8 @@ What it does, for a listed entrypoint only:
 - A swap the account refuses (401/403/404) is resent on the host's own bearer,
   the same fail-open the pinned routes use.
 
-Counters land in `inference-follows.json` beside it — `swapped`,
+Counters land in `inference-follows.<pid>.json` beside it (one per daemon, so a
+handover does not reset them; a dead daemon's file is pruned after a week) — `swapped`,
 `retriedUnswapped`, `passthrough` by reason, `lastSwapAt`, `lastRetryAt` — and
 `daemon.log` records the switch turning on or off, the first re-billed request
 of each daemon, and refusals (at most one line per five minutes).

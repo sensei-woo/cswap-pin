@@ -3066,7 +3066,8 @@ class _InferenceStats:
     """
 
     def __init__(self, certdir):
-        self._path = Path(certdir) / _INFERENCE_STATS_FILE if certdir else None
+        self._path = (Path(certdir) / f"inference-follows.{os.getpid()}.json"
+                      if certdir else None)
         self._lock = threading.Lock()
         self._data = {
             "pid": os.getpid(),
@@ -3114,9 +3115,25 @@ class _InferenceStats:
         t.start()
 
     def _flush_loop(self) -> None:
+        self._prune()
         while True:
             self.flush()
             time.sleep(_INFERENCE_STATS_FLUSH_S)
+
+    def _prune(self) -> None:
+        """Drop other daemons' files once they are dead and a week old."""
+        if self._path is None:
+            return
+        now = time.time()
+        for f in self._path.parent.glob(_INFERENCE_STATS_GLOB):
+            try:
+                pid = int(f.name.split(".")[1])
+                if pid == os.getpid() or _pid_alive(pid):
+                    continue
+                if now - f.stat().st_mtime > _INFERENCE_STATS_KEEP_S:
+                    f.unlink()
+            except (ValueError, IndexError, OSError):
+                continue
 
     def flush(self) -> None:
         if self._path is None:
@@ -6624,8 +6641,12 @@ _TRACE_SWITCH_FILE = "trace-to"
 # Same live-switch shape as `trace-to`: one client entrypoint per line
 # (`claude-desktop`) whose inference is re-billed to cswap's active account.
 _INFERENCE_SWITCH_FILE = "inference-follows"
-# Counters for that path, written by a background thread (see _InferenceStats).
-_INFERENCE_STATS_FILE = "inference-follows.json"
+# Counters for that path, ONE FILE PER DAEMON PID, written by a background
+# thread (see _InferenceStats). Per pid because a handover leaves two daemons
+# alive at once — the successor serving, the predecessor draining — and a
+# shared file let the successor's zeroes overwrite the counts that mattered.
+_INFERENCE_STATS_GLOB = "inference-follows.*.json"
+_INFERENCE_STATS_KEEP_S = 7 * 24 * 3600
 # Re-read at most this often: the check sits on the request path, and a stat
 # per request buys nothing when the answer changes once a day at most.
 _TRACE_RECHECK_S = 2.0
