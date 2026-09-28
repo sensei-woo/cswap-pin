@@ -11927,3 +11927,204 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
             srv._open_conns.add(a)
             srv._stream_conns.add(a)             # no _content_at entry
         assert srv.release_idle_streams() == 0
+
+
+# ---------------------------------------------------------------------------
+# Inference follows the active account for hosts that bring their own login
+# (Claude Desktop's Code tab). Opt-in via `<certdir>/inference-follows`.
+# ---------------------------------------------------------------------------
+
+_DESKTOP_UA = "claude-cli/2.1.281 (external, claude-desktop)"
+_CLI_UA = "claude-cli/2.1.281 (external, cli)"
+
+
+def _follow_proxy(certdir, upstream, token=("ACTIVE", None), pin="PIN-TOKEN"):
+    import time as _time
+
+    from cswap_pin.proxy import PinProxy, _ActiveTokenCache
+
+    tok, exp = token
+    if exp is None:
+        exp = _time.time() + 3600
+    proxy = PinProxy(
+        certdir=certdir,
+        pin_token_provider=lambda: pin,
+        upstream=("127.0.0.1", upstream.port),
+    )
+    proxy._inference_tokens = _ActiveTokenCache(reader=lambda: (tok, exp))
+    return proxy
+
+
+class TestInferenceFollows:
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_ua_entrypoint_parses_claude_cli_only(self):
+        from cswap_pin.proxy import ua_entrypoint
+
+        assert ua_entrypoint(_DESKTOP_UA) == "claude-desktop"
+        assert ua_entrypoint(_CLI_UA) == "cli"
+        assert ua_entrypoint(
+            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.9)") == "sdk-ts"
+        # The session-route UA carries no entrypoint; nor does anything else.
+        assert ua_entrypoint("claude-code/2.1.281") is None
+        assert ua_entrypoint("claude-swap/1.0") is None
+        assert ua_entrypoint("") is None
+
+    def case_route_needs_inference_path_and_listed_entrypoint(self):
+        from cswap_pin.proxy import is_inference_follow_route as f
+
+        on = frozenset({"claude-desktop"})
+        assert f("/v1/messages?beta=true", _DESKTOP_UA, on)
+        assert f("/v1/messages/count_tokens", _DESKTOP_UA, on)
+        assert not f("/v1/messages", _CLI_UA, on)
+        assert not f("/v1/messages", _DESKTOP_UA, frozenset())
+        assert not f("/api/oauth/usage", _DESKTOP_UA, on)
+        assert not f("/v1/code/sessions", _DESKTOP_UA, on)
+        assert not f("/v1/messages/batches", _DESKTOP_UA, on)
+
+    def case_switch_file_env_and_comments(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+        (certdir / "inference-follows").write_text(
+            "# on 2026-09-27\nclaude-desktop  # the Code tab\n\n")
+        pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == {"claude-desktop"}
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "")
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+
+    def case_desktop_inference_gets_active_bearer(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
+        upstream = _FakeUpstream(certdir)
+        proxy = _follow_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages?beta=true",
+                                        bearer="HOST-TOKEN", ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            # The CLI already reads the active account; it is left alone.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="CLI-TOKEN",
+                                        ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer CLI-TOKEN"
+            # Ownership routes keep the PIN, whoever asks.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/code/sessions",
+                                        bearer="HOST-TOKEN", ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer PIN-TOKEN"
+            proxy._inference_stats.flush()
+            stats = json.loads((certdir / "inference-follows.json").read_text())
+            assert stats["swapped"] == 1
+            assert stats["entrypoints"] == ["claude-desktop"]
+            assert stats["lastSwapAt"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_off_without_the_switch(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = _follow_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="HOST-TOKEN",
+                                        ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_refused_swap_is_resent_on_host_bearer(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE")
+        proxy = _follow_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="HOST-TOKEN",
+                                        ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            proxy._inference_stats.flush()
+            stats = json.loads((certdir / "inference-follows.json").read_text())
+            assert stats["retriedUnswapped"] == 1
+            assert stats["lastRetryAt"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_expiring_or_same_token_passes_through(self, certdir, monkeypatch):
+        import time as _time
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
+        upstream = _FakeUpstream(certdir)
+        proxy = _follow_proxy(certdir, upstream,
+                              token=("ACTIVE", _time.time() + 10))
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="HOST-TOKEN",
+                                        ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="ACTIVE",
+                                        ua=_DESKTOP_UA)
+            proxy._inference_stats.flush()
+            stats = json.loads((certdir / "inference-follows.json").read_text())
+            assert stats["swapped"] == 0
+            assert stats["passthrough"]["expiring"] == 2
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_token_cache_reads_once_per_ttl_and_never_blocks(self):
+        import threading as _th
+        import time as _time
+
+        from cswap_pin.proxy import _ActiveTokenCache
+
+        calls = []
+
+        def reader():
+            calls.append(1)
+            return "T", _time.time() + 3600
+
+        c = _ActiveTokenCache(reader=reader, ttl=60)
+        assert c.get() == ("T", "ok")
+        assert c.get() == ("T", "ok")
+        assert len(calls) == 1
+        c.invalidate()
+        assert c.get() == ("T", "ok")
+        assert len(calls) == 2
+        # A reader that hangs holds the lock; everyone else gets the cached
+        # token (still good) instead of queueing behind it.
+        gate = _th.Event()
+
+        def slow():
+            gate.wait(5)
+            return "T2", _time.time() + 3600
+
+        c._reader = slow
+        c.invalidate()
+        t = _th.Thread(target=c.get)
+        t.start()
+        _time.sleep(0.1)
+        assert c.get() == ("T", "ok")
+        gate.set()
+        t.join(5)
+        assert c.get() == ("T2", "ok")
+        empty = _ActiveTokenCache(reader=lambda: (None, None))
+        assert empty.get() == (None, "no-token")

@@ -499,6 +499,46 @@ measured their graceful path as *more destructive than `kill -9`* for want of
 that distinction. `PortHolder.stop()` — a deliberate release — sends the
 `SIGHUP` itself, so releasing the port really releases it.
 
+## Hosts that bring their own login (Claude Desktop)
+
+Everything above assumes inference already follows cswap, and for the `claude`
+CLI it does: it reads the Keychain cswap swaps. **Claude Desktop's Code tab
+does not.** It spawns its bundled CLI with the app's own login in
+`CLAUDE_CODE_OAUTH_TOKEN`, and under a desktop entrypoint Claude Code ignores
+any settings `env` entry naming a variable the host set at spawn — so no
+configuration reaches it. Desktop bills the account the app is signed into,
+and after a rotation it is the one client left on "Weekly limit reached".
+
+Its traffic still comes through this proxy, and its User-Agent names the
+entrypoint (`claude-cli/<ver> (external, claude-desktop)`). So, opt-in, the
+proxy can re-bill it: list the entrypoints in `inference-follows` in the pin's
+directory, one per line.
+
+```bash
+echo claude-desktop > ~/.claude-swap-backup/pin-proxy/inference-follows   # on
+rm ~/.claude-swap-backup/pin-proxy/inference-follows                      # off
+```
+
+The file is re-read every 2 seconds, so it reaches a daemon that is already
+serving. `CSWAP_PIN_INFERENCE_FOLLOWS=claude-desktop` (comma-separated) wins
+over the file, like `CSWAP_PIN_DEBUG` over `trace-to`.
+
+What it does, for a listed entrypoint only:
+
+- `/v1/messages` and `/v1/messages/count_tokens` get the active account's
+  bearer — cswap's own Keychain reader, cached 30 seconds, so a rotation is
+  picked up within that. Nothing else moves: ownership routes keep the pin,
+  and `/api/oauth/*`, usage and profile calls keep the host's own login.
+- A token within a minute of expiry is not used, and the proxy never refreshes
+  one (refresh tokens are single-use; the CLI keeps the Keychain copy fresh).
+- A swap the account refuses (401/403/404) is resent on the host's own bearer,
+  the same fail-open the pinned routes use.
+
+Counters land in `inference-follows.json` beside it — `swapped`,
+`retriedUnswapped`, `passthrough` by reason, `lastSwapAt`, `lastRetryAt` — and
+`daemon.log` records the switch turning on or off, the first re-billed request
+of each daemon, and refusals (at most one line per five minutes).
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that

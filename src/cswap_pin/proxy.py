@@ -2897,6 +2897,244 @@ def trace_target(certdir) -> "str | None":
     return target
 
 
+# ---------------------------------------------------------------------------
+# Inference follows the active account, for hosts that inject their own login.
+#
+# WHY THIS EXISTS. The pin's premise is that inference bills whatever cswap
+# swapped onto disk, and for the `claude` CLI that holds: it reads the
+# Keychain. Claude Desktop's Code tab does not. It spawns its bundled CLI with
+# the APP's own login in CLAUDE_CODE_OAUTH_TOKEN, and under a desktop
+# entrypoint Claude Code drops any settings `env` entry naming a variable the
+# host set at spawn (`hostSpawnEnvKeys`) — so no configuration reaches it.
+# Desktop keeps billing the account the app is signed into, and a rotation
+# that moved every other client leaves it blocked on "Weekly limit reached".
+#
+# Its traffic still arrives HERE (the `.claude.json` env block that wires the
+# pin is not a host-set key), and its User-Agent names the entrypoint, so this
+# proxy is the one place that can close the gap. Opt-in, per entrypoint, and
+# only on the inference routes: ownership routes keep their pinned bearer, and
+# `/api/oauth/*`, usage and profile calls keep the host's own.
+# ---------------------------------------------------------------------------
+
+_INFERENCE_ROUTES = frozenset({"/v1/messages", "/v1/messages/count_tokens"})
+# Seconds a read of the active credential is reused. The read goes through
+# cswap's Keychain reader (a `security` subprocess, 5s timeout), and every
+# Desktop turn makes several inference calls — reading per request would put
+# that subprocess on the hot path. A rotation is picked up within this bound.
+_ACTIVE_TOKEN_TTL_S = 30.0
+# A token this close to expiry is not handed out: the swap would 401, and the
+# retry would bill the host account anyway. The CLI refreshes the Keychain
+# copy on its own schedule; we never refresh it (refresh tokens are
+# one-time-use, and a second refresher strands every other copy).
+_ACTIVE_TOKEN_MIN_LIFE_S = 60.0
+_INFERENCE_STATS_FLUSH_S = 10.0
+_INFERENCE_CACHE: dict = {}
+_UA_ENTRYPOINT = re.compile(r"^\s*claude-cli/\S+\s+\(([^)]*)\)")
+
+
+def inference_follow_entrypoints(certdir) -> "frozenset[str]":
+    """Client entrypoints whose inference is re-billed to the active account.
+
+    ``CSWAP_PIN_INFERENCE_FOLLOWS`` (comma-separated) wins; absent it,
+    ``<certdir>/inference-follows`` lists one entrypoint per line, re-read at
+    most every ``_TRACE_RECHECK_S`` — so the switch reaches a daemon that is
+    already serving, exactly like ``trace-to``. Missing, empty or unreadable
+    is OFF: this must never be the thing that breaks a request.
+    """
+    env = os.environ.get("CSWAP_PIN_INFERENCE_FOLLOWS")
+    if env is not None:
+        return frozenset(e.strip() for e in env.split(",") if e.strip())
+    if certdir is None:
+        return frozenset()
+    key = str(certdir)
+    seen, value = _INFERENCE_CACHE.get(key, (0.0, frozenset()))
+    now = time.time()
+    if now - seen < _TRACE_RECHECK_S:
+        return value
+    try:
+        text = (Path(certdir) / _INFERENCE_SWITCH_FILE).read_text()
+        value = frozenset(
+            line.split("#", 1)[0].strip() for line in text.splitlines()
+        ) - {""}
+    except OSError:
+        value = frozenset()
+    _INFERENCE_CACHE[key] = (now, value)
+    return value
+
+
+def ua_entrypoint(ua: str) -> "str | None":
+    """The entrypoint a Claude Code User-Agent names, or None.
+
+    Claude Code sends ``claude-cli/<ver> (external, <entrypoint>[, …])`` on
+    its API calls (binary: ``(external, ${CLAUDE_CODE_ENTRYPOINT??"cli"}…)``).
+    The ``claude-code/<ver>`` form used on session routes carries no
+    entrypoint and never matches, which is fine: it never reaches inference.
+    """
+    m = _UA_ENTRYPOINT.match(ua or "")
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split(",")]
+    return parts[1] if len(parts) > 1 and parts[1] else None
+
+
+def is_inference_follow_route(path: str, ua: str,
+                              entrypoints: "frozenset[str]") -> bool:
+    """Whether this request's bearer should become the active account's."""
+    if not entrypoints:
+        return False
+    if path.split("?", 1)[0].rstrip("/") not in _INFERENCE_ROUTES:
+        return False
+    return ua_entrypoint(ua) in entrypoints
+
+
+def _active_oauth_credential() -> "tuple[str | None, float | None]":
+    """(access token, expiry in epoch seconds) of cswap's active account.
+
+    Same reader as :func:`_active_oauth_token`, keeping ``expiresAt`` so a
+    token about to lapse is not handed out.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        raw = json.loads(sw._read_credentials() or "{}")
+        oauth_ = raw.get("claudeAiOauth") or {}
+        exp = oauth_.get("expiresAt")
+        return (oauth_.get("accessToken") or None,
+                float(exp) / 1000.0 if exp else None)
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None, None
+
+
+class _ActiveTokenCache:
+    """The active account's token, re-read at most every ``ttl`` seconds.
+
+    NON-BLOCKING for everyone but the reader. A Keychain read that hangs
+    (measured here: one still hung after 2d19h) must not park every Desktop
+    request behind it, so a request that finds a refresh in flight uses the
+    cached token if it is still good and otherwise passes through on the
+    host's own bearer.
+    """
+
+    def __init__(self, reader=None, ttl: float = _ACTIVE_TOKEN_TTL_S,
+                 min_life: float = _ACTIVE_TOKEN_MIN_LIFE_S):
+        self._reader = reader or _active_oauth_credential
+        self._ttl = ttl
+        self._min_life = min_life
+        self._lock = threading.Lock()
+        self._token: "str | None" = None
+        self._expires: "float | None" = None
+        self._read_at = 0.0
+
+    def _usable(self, now: float) -> "str | None":
+        if not self._token:
+            return None
+        if self._expires is not None and self._expires - now < self._min_life:
+            return None
+        return self._token
+
+    def get(self) -> "tuple[str | None, str]":
+        """(token, reason). reason: ok | no-token | expiring | busy."""
+        now = time.time()
+        if now - self._read_at < self._ttl:
+            tok = self._usable(now)
+            return (tok, "ok") if tok else (None, self._why_not(now))
+        if not self._lock.acquire(blocking=False):
+            tok = self._usable(now)
+            return (tok, "ok") if tok else (None, "busy")
+        try:
+            self._token, self._expires = self._reader()
+            self._read_at = time.time()
+        finally:
+            self._lock.release()
+        now = time.time()
+        tok = self._usable(now)
+        return (tok, "ok") if tok else (None, self._why_not(now))
+
+    def _why_not(self, now: float) -> str:
+        return "no-token" if not self._token else "expiring"
+
+    def invalidate(self) -> None:
+        self._read_at = 0.0
+
+
+class _InferenceStats:
+    """Counters for the inference-follow path, flushed to a JSON file.
+
+    The file is how anyone checks this is working without a trace: a
+    monitor reads ``swapped``/``retried`` and the timestamps. Written by a
+    background thread only — the request path never opens a file (see
+    `_write_capped_line` for why that rule exists).
+    """
+
+    def __init__(self, certdir):
+        self._path = Path(certdir) / _INFERENCE_STATS_FILE if certdir else None
+        self._lock = threading.Lock()
+        self._data = {
+            "pid": os.getpid(),
+            "component": _COMPONENT,
+            "startedAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "entrypoints": [],
+            "swapped": 0,
+            "retriedUnswapped": 0,
+            "passthrough": {"no-token": 0, "expiring": 0, "busy": 0,
+                            "same-token": 0},
+            "lastSwapAt": None,
+            "lastRetryAt": None,
+        }
+        self._dirty = True
+        self._thread = None
+
+    def bump(self, key: str, sub: "str | None" = None,
+             stamp: "str | None" = None) -> None:
+        with self._lock:
+            if sub is None:
+                self._data[key] = self._data.get(key, 0) + 1
+            else:
+                bucket = self._data.setdefault(key, {})
+                bucket[sub] = bucket.get(sub, 0) + 1
+            if stamp:
+                self._data[stamp] = _dt.datetime.now(
+                    _dt.timezone.utc).isoformat()
+            self._dirty = True
+        self._ensure_flusher()
+
+    def note_entrypoints(self, eps: "frozenset[str]") -> None:
+        cur = sorted(eps)
+        with self._lock:
+            if cur != self._data["entrypoints"]:
+                self._data["entrypoints"] = cur
+                self._dirty = True
+        self._ensure_flusher()
+
+    def _ensure_flusher(self) -> None:
+        if self._thread is not None or self._path is None:
+            return
+        t = threading.Thread(target=self._flush_loop,
+                             name="inference-stats", daemon=True)
+        self._thread = t
+        t.start()
+
+    def _flush_loop(self) -> None:
+        while True:
+            self.flush()
+            time.sleep(_INFERENCE_STATS_FLUSH_S)
+
+    def flush(self) -> None:
+        if self._path is None:
+            return
+        with self._lock:
+            if not self._dirty:
+                return
+            snap = json.loads(json.dumps(self._data))
+            snap["updatedAt"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            self._dirty = False
+        try:
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snap, indent=2) + "\n")
+            os.replace(tmp, self._path)
+        except OSError:
+            pass
+
+
 # Claude Code's own clients. cswap's urllib callers say ``claude-swap/``.
 _CLAUDE_CODE_UA = ("claude-code/", "claude-cli/")
 
@@ -6383,6 +6621,11 @@ _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 _STATE_FILE = "proxy.json"
 # Writing this file reaches a daemon that is already serving.
 _TRACE_SWITCH_FILE = "trace-to"
+# Same live-switch shape as `trace-to`: one client entrypoint per line
+# (`claude-desktop`) whose inference is re-billed to cswap's active account.
+_INFERENCE_SWITCH_FILE = "inference-follows"
+# Counters for that path, written by a background thread (see _InferenceStats).
+_INFERENCE_STATS_FILE = "inference-follows.json"
 # Re-read at most this often: the check sits on the request path, and a stat
 # per request buys nothing when the answer changes once a day at most.
 _TRACE_RECHECK_S = 2.0
@@ -11342,6 +11585,12 @@ class PinProxy:
     ):
         self._certdir = Path(certdir)
         self._pin_token_provider = pin_token_provider
+        # Inference-follows (opt-in; see `inference_follow_entrypoints`).
+        self._inference_tokens = _ActiveTokenCache()
+        self._inference_stats = _InferenceStats(self._certdir)
+        self._inference_eps_logged: "frozenset[str] | None" = None
+        self._inference_first_swap_logged = False
+        self._inference_retry_logged_at = 0.0
         # Where the MITM'd anthropic request is really sent. Defaults to the
         # real upstream; tests point it at a fake server.
         self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
@@ -15148,6 +15397,15 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
+        # INFERENCE FOLLOWS THE ACTIVE ACCOUNT, for a host that brought its own
+        # login (see `inference_follow_entrypoints`). Never on a pinned route:
+        # those already carry the pinned bearer, and ownership must not move.
+        followed = False
+        if not pinned:
+            new_headers = self._inference_follow_headers(path, ua, headers)
+            if new_headers is not None:
+                headers = new_headers
+                swapped = followed = True
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
         # here. One MITM connection is one thread, so there is no sharing.
@@ -15226,12 +15484,80 @@ class PinProxy:
             # went out unpinned", which is the failure mode the whole module is
             # already built to tolerate.
             self._drop_upstream()
+            if followed:
+                self._note_inference_retry(path)
             keep = self._forward(method, path, original_headers, body, tls)
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
             if k.lower() == "connection" and "close" in v.lower():
                 keep = False
         return keep
+
+    def _inference_follow_headers(self, path: str, ua: str,
+                                  headers: "list[tuple[str, str]]"):
+        """Headers re-billed to the active account, or None to leave them.
+
+        Returns None whenever the swap is off, does not apply, or cannot be
+        done safely — the request then goes out exactly as the host sent it.
+        That is the fail-open the rest of this module uses: a re-bill that
+        cannot happen must never block the work.
+        """
+        eps = inference_follow_entrypoints(self._certdir)
+        if eps != self._inference_eps_logged:
+            prev, self._inference_eps_logged = self._inference_eps_logged, eps
+            self._inference_stats.note_entrypoints(eps)
+        else:
+            prev = eps
+        # Logged on a CHANGE only, and never for a daemon that was always off:
+        # most machines never enable this, and their log should not say so.
+        if prev != eps and (eps or prev):
+            _log_lifecycle(
+                "inference-follows: "
+                + (f"ON for {', '.join(sorted(eps))} — their /v1/messages bill "
+                   "cswap's active account" if eps else "OFF"))
+        if not is_inference_follow_route(path, ua, eps):
+            return None
+        token, why = self._inference_tokens.get()
+        if not token:
+            self._inference_stats.bump("passthrough", why)
+            return None
+        current = next((v for k, v in headers
+                        if k.lower() == "authorization"), "")
+        if current == f"Bearer {token}":
+            # The host is already signed into the active account.
+            self._inference_stats.bump("passthrough", "same-token")
+            return None
+        # x-organization-uuid names the HOST's org; Claude Code does not send
+        # it on inference today, but if it ever does, a header naming one org
+        # beside another org's bearer is a 403 waiting to happen.
+        out = [
+            (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
+            for k, v in headers
+            if k.lower() != "x-organization-uuid"
+        ]
+        self._inference_stats.bump("swapped", stamp="lastSwapAt")
+        if not self._inference_first_swap_logged:
+            self._inference_first_swap_logged = True
+            _log_lifecycle(
+                f"inference-follows: first {ua_entrypoint(ua)} inference "
+                "request re-billed to cswap's active account")
+        return out
+
+    def _note_inference_retry(self, path: str) -> None:
+        """The active account refused a re-billed request; it goes out as sent.
+
+        Invalidates the cached token (a rotation or refresh may have replaced
+        it) and logs at most once per 5 minutes — a refusing account refuses
+        every request, and the count is in the stats file.
+        """
+        self._inference_tokens.invalidate()
+        self._inference_stats.bump("retriedUnswapped", stamp="lastRetryAt")
+        now = time.monotonic()
+        if now - self._inference_retry_logged_at >= 300:
+            self._inference_retry_logged_at = now
+            _log_lifecycle(
+                f"inference-follows: the active account refused {path.split('?', 1)[0]} "
+                "(401/403/404) — resent on the host's own bearer")
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False) -> bool:
