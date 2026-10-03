@@ -3004,6 +3004,54 @@ def _active_oauth_credential() -> "tuple[str | None, float | None]":
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# Claude Design is owned by a SEPARATE credential, and the pin owns it too.
+#
+# `/design login` mints its own OAuth grant (`designOauth`, scopes
+# `user:design:read`/`write`) for whichever claude.ai account the BROWSER
+# authorized; Claude Code's ordinary login carries no design scope, so the
+# design service rejects it (403 `needs_design_scopes`). Claude Code itself
+# sends the design grant on `/v1/design/*` (the Design MCP) and on the
+# `anthropic.omelette.*` gRPC routes (Design Sync). Two callers do not:
+# a host that brought its own login (Claude Desktop, which never reads the
+# Keychain), and a third-party client handed a placeholder bearer (the
+# `pinned-artifacts` pattern) — both reach the design service with a token it
+# refuses. The design grant lives beside the login in the credential store
+# and, since cswap carries it across switches, it IS the machine's design
+# identity: swap it in for everyone, fail-open, same-token passthrough.
+# Ownership of design projects then follows the pinned side, like artifacts.
+#
+# NEVER REFRESHED HERE. Claude Code refreshes the grant on a 401; a refresh
+# token is one-time-use, so a second refresher strands its copy. A grant
+# within `_ACTIVE_TOKEN_MIN_LIFE_S` of expiry is simply not handed out.
+# ---------------------------------------------------------------------------
+
+_DESIGN_ROUTE_PREFIXES = ("/v1/design/", "/anthropic.omelette.")
+
+
+def is_design_route(path: str) -> bool:
+    """Whether a request reaches Claude Design or Design Sync."""
+    return path.split("?", 1)[0].startswith(_DESIGN_ROUTE_PREFIXES)
+
+
+def _live_design_credential() -> "tuple[str | None, float | None]":
+    """(access token, expiry in epoch seconds) of the machine's design grant.
+
+    Read from the LIVE credential object, through cswap's own reader like
+    :func:`_active_oauth_credential`: the grant is a sibling of
+    ``claudeAiOauth`` and cswap keeps it live-owned across switches.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        raw = json.loads(sw._read_credentials() or "{}")
+        d = raw.get("designOauth") or {}
+        exp = d.get("expiresAt")
+        return (d.get("accessToken") or None,
+                float(exp) / 1000.0 if exp else None)
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None, None
+
+
 class _ActiveTokenCache:
     """The active account's token, re-read at most every ``ttl`` seconds.
 
@@ -3080,6 +3128,13 @@ class _InferenceStats:
                             "same-token": 0},
             "lastSwapAt": None,
             "lastRetryAt": None,
+            # The design-grant swap (see `is_design_route`), same shape.
+            "designSwapped": 0,
+            "designRetriedUnswapped": 0,
+            "designPassthrough": {"no-token": 0, "expiring": 0, "busy": 0,
+                                  "same-token": 0},
+            "lastDesignSwapAt": None,
+            "lastDesignRetryAt": None,
         }
         self._dirty = True
         self._thread = None
@@ -11612,6 +11667,9 @@ class PinProxy:
         self._inference_eps_logged: "frozenset[str] | None" = None
         self._inference_first_swap_logged = False
         self._inference_retry_logged_at = 0.0
+        self._design_tokens = _ActiveTokenCache(reader=_live_design_credential)
+        self._design_first_swap_logged = False
+        self._design_retry_logged_at = 0.0
         # Where the MITM'd anthropic request is really sent. Defaults to the
         # real upstream; tests point it at a fake server.
         self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
@@ -15427,6 +15485,15 @@ class PinProxy:
             if new_headers is not None:
                 headers = new_headers
                 swapped = followed = True
+        # THE DESIGN GRANT, for whoever reaches the design service without
+        # it (see `is_design_route`). Disjoint from both swaps above: design
+        # routes are neither ownership routes nor inference.
+        designed = False
+        if not pinned and not followed:
+            new_headers = self._design_headers(path, headers)
+            if new_headers is not None:
+                headers = new_headers
+                swapped = designed = True
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
         # here. One MITM connection is one thread, so there is no sharing.
@@ -15507,6 +15574,8 @@ class PinProxy:
             self._drop_upstream()
             if followed:
                 self._note_inference_retry(path)
+            if designed:
+                self._note_design_retry(path)
             keep = self._forward(method, path, original_headers, body, tls)
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
@@ -15579,6 +15648,55 @@ class PinProxy:
             _log_lifecycle(
                 f"inference-follows: the active account refused {path.split('?', 1)[0]} "
                 "(401/403/404) — resent on the host's own bearer")
+
+    def _design_headers(self, path: str,
+                        headers: "list[tuple[str, str]]"):
+        """Headers carrying the machine's design grant, or None to leave them.
+
+        None whenever the route is not a design route, there is no usable
+        grant, or the caller already sends it — the request then goes out
+        exactly as sent. Fail-open, like every swap in this module.
+        """
+        if not is_design_route(path):
+            return None
+        token, why = self._design_tokens.get()
+        if not token:
+            self._inference_stats.bump("designPassthrough", why)
+            return None
+        current = next((v for k, v in headers
+                        if k.lower() == "authorization"), "")
+        if current == f"Bearer {token}":
+            # Claude Code's own client sends the grant itself.
+            self._inference_stats.bump("designPassthrough", "same-token")
+            return None
+        if not current:
+            # No bearer at all is not a credentialed call; nothing to swap.
+            return None
+        out = [
+            (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
+            for k, v in headers
+            if k.lower() != "x-organization-uuid"
+        ]
+        self._inference_stats.bump("designSwapped", stamp="lastDesignSwapAt")
+        if not self._design_first_swap_logged:
+            self._design_first_swap_logged = True
+            _log_lifecycle(
+                f"design: first {path.split('?', 1)[0]} request sent with the "
+                "machine's Claude Design grant")
+        return out
+
+    def _note_design_retry(self, path: str) -> None:
+        """The design service refused the grant; the request went out as sent."""
+        self._design_tokens.invalidate()
+        self._inference_stats.bump("designRetriedUnswapped",
+                                   stamp="lastDesignRetryAt")
+        now = time.monotonic()
+        if now - self._design_retry_logged_at >= 300:
+            self._design_retry_logged_at = now
+            _log_lifecycle(
+                f"design: the service refused the design grant on "
+                f"{path.split('?', 1)[0]} (401/403/404) — resent on the "
+                "caller's own bearer")
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False) -> bool:

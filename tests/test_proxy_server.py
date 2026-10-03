@@ -12128,3 +12128,117 @@ class TestInferenceFollows:
         assert c.get() == ("T2", "ok")
         empty = _ActiveTokenCache(reader=lambda: (None, None))
         assert empty.get() == (None, "no-token")
+
+
+def _design_proxy(certdir, upstream, token=("DESIGN", None), pin="PIN-TOKEN"):
+    import time as _time
+
+    from cswap_pin.proxy import PinProxy, _ActiveTokenCache
+
+    tok, exp = token
+    if exp is None:
+        exp = _time.time() + 3600
+    proxy = PinProxy(
+        certdir=certdir,
+        pin_token_provider=lambda: pin,
+        upstream=("127.0.0.1", upstream.port),
+    )
+    proxy._design_tokens = _ActiveTokenCache(reader=lambda: (tok, exp))
+    return proxy
+
+
+class TestDesignGrant:
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_route_is_design_mcp_or_omelette(self):
+        from cswap_pin.proxy import is_design_route as f, is_pinned_route
+
+        assert f("/v1/design/mcp")
+        assert f("/v1/design/consent?x=1")
+        assert f("/v1/design/grants")
+        assert f("/anthropic.omelette.api.v1alpha.OmeletteService/GetProject")
+        assert not f("/v1/designs")
+        assert not f("/v1/messages")
+        assert not f("/api/frame/deploy")
+        # Design routes are a third category: never pinned, never inference.
+        assert not is_pinned_route("/v1/design/mcp")
+
+    def case_foreign_bearer_gets_the_design_grant(self, certdir):
+        upstream = _FakeUpstream(certdir)
+        proxy = _design_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/design/mcp",
+                                        bearer="placeholder", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer DESIGN"
+            st = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/anthropic.omelette.api.v1alpha.OmeletteService/GetProject",
+                bearer="HOST-TOKEN", ua=_DESKTOP_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer DESIGN"
+            # Claude Code's own client already sends the grant: untouched.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/design/mcp", bearer="DESIGN",
+                                        ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer DESIGN"
+            # Inference and ownership routes are not design routes.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="CLI-TOKEN",
+                                        ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer CLI-TOKEN"
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/frame/frames",
+                                        bearer="placeholder", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer PIN-TOKEN"
+            proxy._inference_stats.flush()
+            stats = json.loads(proxy._inference_stats._path.read_text())
+            assert stats["designSwapped"] == 2
+            assert stats["designPassthrough"]["same-token"] == 1
+            assert stats["lastDesignSwapAt"]
+            assert stats["swapped"] == 0
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_no_grant_passes_through(self, certdir):
+        upstream = _FakeUpstream(certdir)
+        proxy = _design_proxy(certdir, upstream, token=(None, None))
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/design/mcp",
+                                        bearer="HOST-TOKEN", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            proxy._inference_stats.flush()
+            stats = json.loads(proxy._inference_stats._path.read_text())
+            assert stats["designSwapped"] == 0
+            assert stats["designPassthrough"]["no-token"] == 1
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_refused_grant_is_resent_on_the_callers_bearer(self, certdir):
+        upstream = _FakeUpstream(certdir, reject_bearer="DESIGN")
+        proxy = _design_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/design/consent",
+                                        bearer="HOST-TOKEN", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            proxy._inference_stats.flush()
+            stats = json.loads(proxy._inference_stats._path.read_text())
+            assert stats["designRetriedUnswapped"] == 1
+            assert stats["lastDesignRetryAt"]
+        finally:
+            proxy.stop()
+            upstream.stop()
