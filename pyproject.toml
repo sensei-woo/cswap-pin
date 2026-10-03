@@ -1,6 +1,6 @@
 [project]
 name = "cswap-pin"
-version = "0.1.314"
+version = "0.1.314+desktop.3"
 description = "Keep Claude Code's Remote Control and Artifacts on one account while inference follows cswap's account swap"
 readme = "README.md"
 requires-python = ">=3.10"
