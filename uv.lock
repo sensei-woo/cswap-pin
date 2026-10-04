@@ -180,7 +180,7 @@ wheels = [
 
 [[package]]
 name = "cswap-pin"
-version = "0.1.247+desktop.1"
+version = "0.1.247+desktop.3"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

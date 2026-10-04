@@ -3207,6 +3207,127 @@ class _InferenceStats:
             pass
 
 
+
+# ---------------------------------------------------------------------------
+# Rate-limit headers: usage read from inference itself.
+#
+# WHY THIS EXISTS. cswap learns an account's quota from `/api/oauth/usage`,
+# which needs the `user:profile` scope and has its own ~30 req/hour budget
+# per account. A setup-token account (`claude setup-token`, scope
+# `user:inference` only) can never read it, and a full login that exhausts
+# the budget goes blind — and blind used to mean "fail over". But every
+# `/v1/messages` reply already carries the same numbers:
+# `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}` (measured
+# 2026-10-04: 0.23 / 0.77, identical to the usage endpoint's 23% / 77%).
+#
+# This proxy sees every one of those replies, so it records them per BEARER
+# (a sha256 prefix, never the token) and a background thread writes
+# `<certdir>/ratelimits.json`. cswap maps a slot to its readings by
+# fingerprinting the slot's own access token the same way. Passive: no extra
+# request is ever made here, and a read failure only means no reading.
+# ---------------------------------------------------------------------------
+
+RATELIMIT_FILE = "ratelimits.json"
+_RATELIMIT_PREFIX = "anthropic-ratelimit-unified-"
+_RATELIMIT_FLUSH_S = 5.0
+# Readings older than this are dropped on flush: past a week both windows
+# have reset, so the numbers describe nothing.
+_RATELIMIT_KEEP_S = 8 * 24 * 3600
+
+
+def bearer_fingerprint(token: str) -> str:
+    """The key a bearer's readings are filed under (shared with cswap)."""
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def parse_ratelimit_headers(status_line: bytes,
+                            header_lines) -> "dict | None":
+    """The unified rate-limit headers of one reply, or None if it has none."""
+    found: dict = {}
+    for line in header_lines:
+        if b":" not in line:
+            continue
+        k, v = line.split(b":", 1)
+        kl = k.strip().lower().decode("latin1", "replace")
+        if kl.startswith(_RATELIMIT_PREFIX):
+            found[kl[len(_RATELIMIT_PREFIX):]] = (
+                v.strip().decode("latin1", "replace"))
+    if not found:
+        return None
+    try:
+        code = int(status_line.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        code = None
+    return {"at": time.time(), "status": code, "headers": found}
+
+
+class _RateLimitLedger:
+    """Latest rate-limit reading per bearer, flushed to ``ratelimits.json``.
+
+    The request path only updates a dict under a lock; the file is written by
+    a background thread (same rule as `_InferenceStats`). Two daemons can be
+    alive across a handover, so a flush MERGES with what is on disk, newest
+    reading per bearer winning, instead of overwriting it.
+    """
+
+    def __init__(self, certdir):
+        self._path = Path(certdir) / RATELIMIT_FILE if certdir else None
+        self._lock = threading.Lock()
+        self._pending: dict = {}
+        self._thread = None
+
+    def note(self, token: "str | None", status_line: bytes,
+             header_lines) -> None:
+        if not token or self._path is None:
+            return
+        reading = parse_ratelimit_headers(status_line, header_lines)
+        if reading is None:
+            return
+        with self._lock:
+            self._pending[bearer_fingerprint(token)] = reading
+        if self._thread is None:
+            t = threading.Thread(target=self._flush_loop,
+                                 name="ratelimit-ledger", daemon=True)
+            self._thread = t
+            t.start()
+
+    def _flush_loop(self) -> None:
+        while True:
+            time.sleep(_RATELIMIT_FLUSH_S)
+            self.flush()
+
+    def flush(self) -> None:
+        if self._path is None:
+            return
+        with self._lock:
+            if not self._pending:
+                return
+            fresh, self._pending = self._pending, {}
+        try:
+            cur = json.loads(self._path.read_text())
+            tokens = cur.get("tokens") if isinstance(cur, dict) else None
+            if not isinstance(tokens, dict):
+                tokens = {}
+        except (OSError, ValueError):
+            tokens = {}
+        for fp, reading in fresh.items():
+            old = tokens.get(fp)
+            if not isinstance(old, dict) or (old.get("at") or 0) <= reading["at"]:
+                tokens[fp] = reading
+        cutoff = time.time() - _RATELIMIT_KEEP_S
+        tokens = {fp: r for fp, r in tokens.items()
+                  if isinstance(r, dict) and (r.get("at") or 0) >= cutoff}
+        try:
+            tmp = self._path.with_name(f"{RATELIMIT_FILE}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"version": 1, "tokens": tokens},
+                                      indent=2) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._path)
+        except OSError:
+            pass
+
+
 # Claude Code's own clients. cswap's urllib callers say ``claude-swap/``.
 _CLAUDE_CODE_UA = ("claude-code/", "claude-cli/")
 
@@ -11668,6 +11789,8 @@ class PinProxy:
         self._inference_first_swap_logged = False
         self._inference_retry_logged_at = 0.0
         self._design_tokens = _ActiveTokenCache(reader=_live_design_credential)
+        # Rate-limit headers off every inference reply (see `_RateLimitLedger`).
+        self._ratelimits = _RateLimitLedger(self._certdir)
         self._design_first_swap_logged = False
         self._design_retry_logged_at = 0.0
         # Where the MITM'd anthropic request is really sent. Defaults to the
@@ -15877,10 +16000,28 @@ class PinProxy:
                 # Content-Length included, but no body — only the request
                 # method says so.
                 method=method,
+                # USAGE FROM THE REPLY: an inference reply's rate-limit
+                # headers, filed under the bearer that was actually SENT
+                # (after any swap above), which is the account they describe.
+                on_head=self._ratelimit_hook(path, headers),
             )
         except (OSError, ssl.SSLError):
             self._drop_upstream()
             return False
+
+    def _ratelimit_hook(self, path: str, headers):
+        """An ``on_head`` callback for an inference request, else None."""
+        if path.split("?", 1)[0].rstrip("/") != "/v1/messages":
+            return None
+        ledger = getattr(self, "_ratelimits", None)
+        if ledger is None:
+            return None
+        auth = next((v for k, v in headers
+                     if k.lower() == "authorization"), "")
+        if not auth.lower().startswith("bearer "):
+            return None
+        token = auth[7:].strip()
+        return lambda st, lines: ledger.note(token, st, lines)
 
     def _upstream_conn(self) -> ssl.SSLSocket:
         """The live upstream TLS socket for this MITM connection, dialing on
@@ -16903,6 +17044,7 @@ def _relay_response(
     on_status=None,
     path: str | None = None,
     certdir=None,
+    on_head=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -16993,6 +17135,13 @@ def _relay_response(
         try:
             on_status(status_line)
         except Exception:  # noqa: BLE001 — never let a statistic break a reply
+            pass
+    # THE HEADERS, for the rate-limit ledger. Interim (1xx) heads carry none
+    # and the recursion below passes no hook, so only the final reply reports.
+    if on_head is not None:
+        try:
+            on_head(status_line, lines[1:])
+        except Exception:  # noqa: BLE001 — same rule as on_status
             pass
     out = [status_line]
     length: int | None = None

@@ -540,6 +540,21 @@ handover does not reset them; a dead daemon's file is pruned after a week) — `
 `daemon.log` records the switch turning on or off, the first re-billed request
 of each daemon, and refusals (at most one line per five minutes).
 
+## Usage from inference replies (`ratelimits.json`)
+
+Every `/v1/messages` reply carries the account's quota in
+`anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}` — the same
+numbers `/api/oauth/usage` serves, without its `user:profile` scope or its own
+~30 requests/hour budget. The proxy files the latest of those headers per
+bearer in `ratelimits.json` in the pin's directory, keyed by the first 24 hex
+characters of the bearer's sha256 (never the token), written by a background
+thread every 5 seconds and merged newest-wins across daemons. Readings older
+than 8 days are dropped. It is passive: no request is ever added.
+
+The matching claude-swap fork reads it for setup-token slots (which cannot
+call the usage endpoint at all) and as autoswitch's fallback when the active
+account's usage endpoint is unreadable.
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that
