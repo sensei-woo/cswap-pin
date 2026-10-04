@@ -56,7 +56,8 @@ class _FakeUpstream:
     def __init__(self, certdir: Path,
                  reject_bearer: "str | set[str] | None" = None,
                  reject_status: int = 403, reply: bytes | None = None,
-                 reject_missing_auth: bool = False):
+                 reject_missing_auth: bool = False,
+                 extra_headers: bytes = b""):
         # reject_bearer: answer `reject_status` to exactly this credential
         # (or any credential in the set), 200 to any other. Models an
         # endpoint the pinned account may not use — the shape that makes a
@@ -71,6 +72,8 @@ class _FakeUpstream:
         self._reject_missing_auth = reject_missing_auth
         self.reject_status = reject_status
         self.reply = reply
+        # Raw `Name: value\r\n` lines added to every 200 reply.
+        self.extra_headers = extra_headers
         self.seen_auth: str | None = None
         # Every Authorization this server has seen, in order — a single
         # request-response case reconnects per attempt (`Connection: close`
@@ -135,6 +138,7 @@ class _FakeUpstream:
                     continue
                 tls.sendall(self.reply or (
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    + self.extra_headers +
                     b"Content-Type: application/json\r\n\r\n{}"
                 ))
                 tls.close()
@@ -20215,3 +20219,90 @@ class TestDesignGrant:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit headers off inference replies, filed per bearer fingerprint in
+# `<certdir>/ratelimits.json` — cswap's usage source for setup-token slots.
+# ---------------------------------------------------------------------------
+
+_RL_HEADERS = (
+    b"anthropic-ratelimit-unified-5h-utilization: 0.23\r\n"
+    b"anthropic-ratelimit-unified-5h-reset: 1791090600\r\n"
+    b"anthropic-ratelimit-unified-7d-utilization: 0.77\r\n"
+    b"anthropic-ratelimit-unified-7d-reset: 1791306000\r\n"
+    b"anthropic-ratelimit-unified-status: allowed_warning\r\n"
+)
+
+
+class TestRateLimitLedger:
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_parse_keeps_only_unified_headers(self):
+        from cswap_pin.proxy import parse_ratelimit_headers as parse
+
+        r = parse(b"HTTP/1.1 429 Too Many Requests", [
+            b"Content-Type: application/json",
+            b"anthropic-ratelimit-unified-5h-utilization: 1.0",
+            b"Anthropic-Ratelimit-Unified-Status: rejected",
+        ])
+        assert r["status"] == 429
+        assert r["headers"] == {"5h-utilization": "1.0", "status": "rejected"}
+        assert parse(b"HTTP/1.1 200 OK", [b"Content-Length: 2"]) is None
+
+    def case_inference_reply_is_filed_under_the_sent_bearer(
+            self, certdir, monkeypatch):
+        from cswap_pin.proxy import RATELIMIT_FILE, bearer_fingerprint
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
+        upstream = _FakeUpstream(certdir, extra_headers=_RL_HEADERS)
+        proxy = _follow_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            # Desktop's request is re-billed: the reading belongs to ACTIVE,
+            # the bearer that went out, not the host's own.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages?beta=true",
+                                        bearer="HOST-TOKEN", ua=_DESKTOP_UA)
+            assert st == 200
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="CLI-TOKEN",
+                                        ua=_CLI_UA)
+            assert st == 200
+            # Not an inference route: nothing filed, whatever it carries.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/oauth/usage", bearer="OTHER",
+                                        ua=_CLI_UA)
+            assert st == 200
+            proxy._ratelimits.flush()
+            raw = (certdir / RATELIMIT_FILE).read_text()
+            tokens = json.loads(raw)["tokens"]
+            assert set(tokens) == {bearer_fingerprint("ACTIVE"),
+                                   bearer_fingerprint("CLI-TOKEN")}
+            r = tokens[bearer_fingerprint("ACTIVE")]
+            assert r["status"] == 200
+            assert r["headers"]["7d-utilization"] == "0.77"
+            assert "ACTIVE" not in raw
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_flush_merges_newest_per_bearer(self, certdir):
+        import time as _time
+
+        from cswap_pin.proxy import (RATELIMIT_FILE, _RateLimitLedger,
+                                     bearer_fingerprint)
+
+        now = _time.time()
+        (certdir / RATELIMIT_FILE).write_text(json.dumps({"version": 1, "tokens": {
+            "keep": {"at": now - 10, "status": 200, "headers": {"x": "old"}},
+            "stale": {"at": now - 30 * 24 * 3600, "status": 200, "headers": {}},
+        }}))
+        ledger = _RateLimitLedger(certdir)
+        ledger.note("TOK", b"HTTP/1.1 200 OK",
+                    [b"anthropic-ratelimit-unified-status: allowed"])
+        ledger.flush()
+        tokens = json.loads((certdir / RATELIMIT_FILE).read_text())["tokens"]
+        assert set(tokens) == {"keep", bearer_fingerprint("TOK")}
