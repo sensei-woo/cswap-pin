@@ -3394,6 +3394,14 @@ class _InferenceStats:
                                   "same-token": 0},
             "lastDesignSwapAt": None,
             "lastDesignRetryAt": None,
+            # The stand-down swap (see `_stood_down_headers`): a pinned route
+            # while the pinned account IS the active one, same shape.
+            "pinnedStoodDownSwapped": 0,
+            "pinnedStoodDownRetriedUnswapped": 0,
+            "pinnedStoodDownPassthrough": {"no-token": 0, "expiring": 0,
+                                           "busy": 0, "same-token": 0},
+            "lastPinnedStoodDownSwapAt": None,
+            "lastPinnedStoodDownRetryAt": None,
         }
         self._dirty = True
         self._thread = None
@@ -7851,6 +7859,18 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return True  # pin cleared: leaving every bearer alone IS the job
         return _pin_is_the_live_login(target[0])
 
+    def pin_live_login_slot() -> "str | None":
+        """The pinned slot when it IS the live login, else None (pin cleared,
+        or pinned != active). The one stand-down case where the active
+        account's token is the pinned account's token, so a caller that did
+        not bring it (a placeholder bearer) can still be given it -- see
+        `_stood_down_headers`. A cleared pin returns None: nothing is pinned,
+        so nothing is swapped."""
+        target = _current_target()
+        if target is None or not _pin_is_the_live_login(target[0]):
+            return None
+        return str(target[0])
+
     def can_pin_cached() -> bool:
         """Whether the pin can apply RIGHT NOW using only what is already in
         hand -- no store read, no lock, no network. This is what `/health`
@@ -7920,6 +7940,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
     provider.pin_stands_down = pin_stands_down
+    provider.pin_live_login_slot = pin_live_login_slot
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
@@ -8060,6 +8081,16 @@ def _pin_stands_down(provider) -> bool:
                     and provider.pin_stands_down())
     except Exception:
         return False
+
+
+def _pin_live_login_slot(provider) -> "str | None":
+    """`provider.pin_live_login_slot()`, or None for a provider without the
+    hook (a bare test callable) or one that raises: no stand-down swap."""
+    try:
+        fn = getattr(provider, "pin_live_login_slot", None)
+        return fn() if fn else None
+    except Exception:  # noqa: BLE001 — never take a request down
+        return None
 
 
 def _keychain_denied_here() -> bool:
@@ -15293,6 +15324,13 @@ class PinProxy:
         self._ratelimits = _RateLimitLedger(self._certdir)
         self._design_first_swap_logged = False
         self._design_retry_logged_at = 0.0
+        # The stand-down swap (see `_stood_down_headers`). Its own cache,
+        # keyed on the slot it was read for, so a switch INTO the pinned slot
+        # never hands out the previous active account's cached token.
+        self._stood_down_tokens = _ActiveTokenCache()
+        self._stood_down_slot: "str | None" = None
+        self._stood_down_first_swap_logged = False
+        self._stood_down_retry_logged_at = 0.0
         # Where the MITM'd anthropic request is really sent. Defaults to the
         # real upstream; tests point it at a fake server.
         self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
@@ -20038,6 +20076,7 @@ class PinProxy:
             if _tok:
                 self._sweep_bridges_after_connect(_tok)
         swapped = False
+        stood_down = False
         original_headers = list(headers)
         if pinned:
             token = _tok if _tok_fetched else self._pin_token_provider()
@@ -20150,6 +20189,19 @@ class PinProxy:
                 # fail-open case below -- the pin is fine, this request just
                 # carries no Authorization header to rewrite.
             else:
+                # THE PIN STANDS DOWN BECAUSE IT IS THE LIVE LOGIN: the
+                # provider has nothing to swap, which is right for Claude
+                # Code (it already carries the live = pinned bearer) and
+                # wrong for a placeholder-bearer client (`pinned-artifacts`),
+                # which used to go out as-is and 401. Give such a caller the
+                # live login's token; same-token passthrough otherwise.
+                stood_slot = _pin_live_login_slot(self._pin_token_provider)
+                if stood_slot is not None:
+                    new_headers = self._stood_down_headers(
+                        stood_slot, path, headers)
+                    if new_headers is not None:
+                        headers = new_headers
+                        swapped = stood_down = True
                 # Fail-open: the request still goes, on the disk bearer. That
                 # is deliberate — a pin that cannot resolve must never block
                 # work — but it is silent, and silence here is expensive. A
@@ -20273,6 +20325,14 @@ class PinProxy:
                 # cached token and resend exactly as the host sent it.
                 self._drop_upstream()
                 self._note_inference_retry(path)
+                keep = self._forward(method, path, original_headers, body, tls)
+            elif isinstance(keep, _AuthRejected) and stood_down:
+                # THE STAND-DOWN SWAP, NOT A PINNED ONE: the refetch below
+                # asks a provider that stands down and has nothing better.
+                # The live login refused its own token; resend exactly as the
+                # caller sent it -- what this route did before the swap.
+                self._drop_upstream()
+                self._note_stood_down_retry(path)
                 keep = self._forward(method, path, original_headers, body, tls)
             elif isinstance(keep, _AuthRejected) and designed:
                 # THE DESIGN GRANT, NOT A PINNED SWAP: the refetch below
@@ -20553,6 +20613,65 @@ class PinProxy:
                 f"design: first {path.split('?', 1)[0]} request sent with the "
                 "machine's Claude Design grant")
         return out
+
+    def _stood_down_headers(self, slot: str, path: str,
+                            headers: "list[tuple[str, str]]"):
+        """Headers carrying the live login's token on a pinned route whose
+        pin stands down because it IS the live login, or None to leave them.
+
+        The live login's token is the pinned account's token in this state,
+        so this is the pin's own swap by another reader: cswap's active
+        credential, the design grant's rules -- not handed out within
+        `_ACTIVE_TOKEN_MIN_LIFE_S` of expiry, NEVER refreshed here (Claude
+        Code refreshes its own login; a second refresher strands it), and
+        no swap for a caller that already sends it or sends no bearer.
+        """
+        if slot != self._stood_down_slot:
+            # A switch INTO the pinned slot: whatever is cached was read for
+            # another account (or nothing yet). Re-read before handing out.
+            self._stood_down_tokens.invalidate()
+            self._stood_down_slot = slot
+        token, why = self._stood_down_tokens.get()
+        if not token:
+            self._inference_stats.bump("pinnedStoodDownPassthrough", why)
+            return None
+        current = next((v for k, v in headers
+                        if k.lower() == "authorization"), "")
+        if current == f"Bearer {token}":
+            # Claude Code's own client: it already carries the live login.
+            self._inference_stats.bump("pinnedStoodDownPassthrough",
+                                       "same-token")
+            return None
+        if not current:
+            # No bearer at all is not a credentialed call; nothing to swap.
+            return None
+        out = [
+            (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
+            for k, v in headers
+        ]
+        self._inference_stats.bump("pinnedStoodDownSwapped",
+                                   stamp="lastPinnedStoodDownSwapAt")
+        if not self._stood_down_first_swap_logged:
+            self._stood_down_first_swap_logged = True
+            _log_lifecycle(
+                f"pin stands down (pinned == active): first "
+                f"{path.split('?', 1)[0]} request from a caller without the "
+                "live login sent with the live (pinned) login's token")
+        return out
+
+    def _note_stood_down_retry(self, path: str) -> None:
+        """The live login refused its own token on a stood-down pinned route;
+        the request went out as the caller sent it."""
+        self._stood_down_tokens.invalidate()
+        self._inference_stats.bump("pinnedStoodDownRetriedUnswapped",
+                                   stamp="lastPinnedStoodDownRetryAt")
+        now = time.monotonic()
+        if now - self._stood_down_retry_logged_at >= 300:
+            self._stood_down_retry_logged_at = now
+            _log_lifecycle(
+                f"pin stands down: the live login refused its own token on "
+                f"{path.split('?', 1)[0]} (401/403/404) — resent on the "
+                "caller's own bearer")
 
     def _note_design_retry(self, path: str) -> None:
         """The design service refused the grant; the request went out as sent."""

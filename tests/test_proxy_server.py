@@ -20306,3 +20306,158 @@ class TestRateLimitLedger:
         ledger.flush()
         tokens = json.loads((certdir / RATELIMIT_FILE).read_text())["tokens"]
         assert set(tokens) == {"keep", bearer_fingerprint("TOK")}
+
+
+def _stood_down_proxy(certdir, upstream, token=("LIVE", None), slot="1"):
+    """A pin that stands down because it IS the live login (slot), or one
+    that simply has no token (slot=None): the provider returns None either
+    way, as `make_pin_token_provider`'s does."""
+    import time as _time
+
+    from cswap_pin.proxy import PinProxy, _ActiveTokenCache
+
+    tok, exp = token
+    if exp is None:
+        exp = _time.time() + 3600
+    state = {"slot": slot}
+
+    def provider():
+        return None
+
+    provider.pin_is_noop = lambda: state["slot"] is not None
+    provider.pin_stands_down = lambda: state["slot"] is not None
+    provider.pin_live_login_slot = lambda: state["slot"]
+    reads = []
+
+    def reader():
+        reads.append(state["slot"])
+        return tok, exp
+
+    proxy = PinProxy(
+        certdir=certdir,
+        pin_token_provider=provider,
+        upstream=("127.0.0.1", upstream.port),
+    )
+    proxy._stood_down_tokens = _ActiveTokenCache(reader=reader)
+    return proxy, state, reads
+
+
+class TestPinStoodDownSwap:
+    """Pinned == active: the provider stands down. A placeholder-bearer
+    client (`pinned-artifacts`) used to go out on its placeholder and 401."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _stats(self, proxy):
+        proxy._inference_stats.flush()
+        return json.loads(proxy._inference_stats._path.read_text())
+
+    def case_placeholder_gets_the_live_login(self, certdir):
+        upstream = _FakeUpstream(certdir)
+        proxy, _, _ = _stood_down_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/frame/frames",
+                                        bearer="placeholder", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer LIVE"
+            # Claude Code's own client already carries it: untouched.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/frame/frames", bearer="LIVE",
+                                        ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer LIVE"
+            # Inference is not a pinned route: never touched by this swap.
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/messages", bearer="CLI-TOKEN",
+                                        ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer CLI-TOKEN"
+            stats = self._stats(proxy)
+            assert stats["pinnedStoodDownSwapped"] == 1
+            assert stats["pinnedStoodDownPassthrough"]["same-token"] == 1
+            assert stats["lastPinnedStoodDownSwapAt"]
+            assert stats["swapped"] == 0
+            assert stats["designSwapped"] == 0
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_not_stood_down_is_unchanged(self, certdir):
+        # Provider has no token and the pin is NOT the live login: the old
+        # fail-open path, caller's bearer as-is, no stand-down swap.
+        upstream = _FakeUpstream(certdir)
+        proxy, _, reads = _stood_down_proxy(certdir, upstream, slot=None)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/frame/frames",
+                                        bearer="placeholder", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer placeholder"
+            assert reads == []
+            stats = self._stats(proxy)
+            assert stats["pinnedStoodDownSwapped"] == 0
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_expiring_or_missing_token_passes_through(self, certdir):
+        import time as _time
+
+        upstream = _FakeUpstream(certdir)
+        proxy, _, _ = _stood_down_proxy(
+            certdir, upstream, token=("LIVE", _time.time() + 30))
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/api/frame/frames",
+                                        bearer="placeholder", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.seen_auth == "Bearer placeholder"
+            stats = self._stats(proxy)
+            assert stats["pinnedStoodDownSwapped"] == 0
+            assert stats["pinnedStoodDownPassthrough"]["expiring"] == 1
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_refused_swap_is_resent_on_the_callers_bearer(self, certdir):
+        upstream = _FakeUpstream(certdir, reject_bearer="LIVE")
+        proxy, _, _ = _stood_down_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            st = _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                        "/v1/code/sessions",
+                                        bearer="HOST-TOKEN", ua=_CLI_UA)
+            assert st == 200
+            assert upstream.auths_seen[-2:] == ["Bearer LIVE",
+                                                "Bearer HOST-TOKEN"]
+            stats = self._stats(proxy)
+            assert stats["pinnedStoodDownSwapped"] == 1
+            assert stats["pinnedStoodDownRetriedUnswapped"] == 1
+            assert stats["lastPinnedStoodDownRetryAt"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_new_live_slot_rereads_the_token(self, certdir):
+        upstream = _FakeUpstream(certdir)
+        proxy, state, reads = _stood_down_proxy(certdir, upstream)
+        proxy.start()
+        try:
+            for _ in range(2):
+                _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                       "/api/frame/frames",
+                                       bearer="placeholder", ua=_CLI_UA)
+            assert reads == ["1"]  # cached within the TTL
+            state["slot"] = "2"    # a re-pin onto a newly live slot
+            _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                   "/api/frame/frames",
+                                   bearer="placeholder", ua=_CLI_UA)
+            assert reads == ["1", "2"]
+        finally:
+            proxy.stop()
+            upstream.stop()
