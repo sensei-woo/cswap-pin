@@ -8994,6 +8994,53 @@ def _install_signal_teardown(cleanup) -> None:
 
 
 _DAEMON_MODULE = "cswap_pin.proxy"
+
+# WHAT THE DAEMON'S PROCESSES ARE CALLED. Spawned as plain `sys.executable`
+# they show up as `python3` to `killall python3` and `pkill -f python` -- the
+# exact sweep a coding agent runs to clean up its OWN scripts, and on one
+# machine six SIGTERMs in four days, one leaving the pin down for 7.5h. Exec'd
+# through a link beside the interpreter instead, the process name (`comm`,
+# what `killall`/`pgrep -x` read) and argv[0] both say `cswap-pin-proxy`; the
+# venv still resolves because the link sits in the same `bin/`. Every lookup
+# of our own processes matches `-m cswap_pin.proxy` further along argv, which
+# does not change.
+_PROCESS_NAME = "cswap-pin-proxy"
+
+
+def _daemon_executable() -> str:
+    """``sys.executable``, reached through a ``cswap-pin-proxy`` link.
+
+    Made on first use and re-made after a reinstall replaces ``bin/``; any
+    failure (read-only env, Windows) falls back to ``sys.executable`` itself,
+    so the worst case is the old name, never a daemon that cannot start.
+    """
+    exe = sys.executable
+    if os.name != "posix" or not exe:
+        return exe
+    bindir, base = os.path.split(exe)
+    if base == _PROCESS_NAME:
+        return exe  # already running under it: holder -> daemon, daemon -> standby
+    link = os.path.join(bindir, _PROCESS_NAME)
+    try:
+        if os.readlink(link) == base:
+            return link
+    except OSError:
+        pass
+    tmp = f"{link}.{os.getpid()}.tmp"
+    try:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        os.symlink(base, tmp)
+        os.replace(tmp, link)
+        return link
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return exe
 # Same module, same certdir, one flag apart — which is why `_pin_daemon_pids`
 # has to exclude it explicitly rather than by argv shape.
 _HOLDER_MODULE_ARG = "--hold-port"
@@ -11680,7 +11727,7 @@ class PortHolder:
         log = _open_daemon_log(self._certdir)
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-m", _DAEMON_MODULE, self._account,
+                [_daemon_executable(), "-m", _DAEMON_MODULE, self._account,
                  self._email, str(self._certdir)],
                 env=env,
                 pass_fds=(fd,),
@@ -11833,7 +11880,7 @@ class PortHolder:
         log = _open_daemon_log(self._certdir)
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-m", _DAEMON_MODULE, _STANDBY_MODULE_ARG,
+                [_daemon_executable(), "-m", _DAEMON_MODULE, _STANDBY_MODULE_ARG,
                  self._account, self._email, str(self._certdir)],
                 env=env,
                 pass_fds=(fd,),
@@ -13000,7 +13047,7 @@ def _spawn_daemon(
     # The holder here ADOPTS the socket it was handed rather than binding a
     # fresh one, so it cannot lose the race that made the cold-start holder
     # fall back — there is nothing to race for.
-    argv = [sys.executable, "-m", _DAEMON_MODULE, _HOLDER_MODULE_ARG,
+    argv = [_daemon_executable(), "-m", _DAEMON_MODULE, _HOLDER_MODULE_ARG,
             str(want_port if want_port else 0), account_num, email,
             str(certdir)]
     try:

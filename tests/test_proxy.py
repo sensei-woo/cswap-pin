@@ -32604,3 +32604,49 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
         assert not (a / "pin-cleared").exists(), (
             "a machine-local settings file needs no marker")
         assert p.load_pin(a) is None
+
+
+class TestDaemonExecutableName:
+    """The daemon runs as `cswap-pin-proxy`, not `python3` (agents' `killall python3`)."""
+
+    def _fake_exe(self, tmp_path):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        exe = bindir / "python3"
+        exe.write_text("")
+        return bindir, exe
+
+    def test_makes_a_link_beside_the_interpreter(self, tmp_path, monkeypatch):
+        import os
+        from cswap_pin import proxy as pp
+        bindir, exe = self._fake_exe(tmp_path)
+        monkeypatch.setattr(pp.sys, "executable", str(exe))
+        got = pp._daemon_executable()
+        assert got == str(bindir / "cswap-pin-proxy")
+        assert os.readlink(got) == "python3"
+        assert "python" not in os.path.basename(got)
+        assert pp._daemon_executable() == got  # idempotent
+
+    def test_replaces_a_stale_link(self, tmp_path, monkeypatch):
+        import os
+        from cswap_pin import proxy as pp
+        bindir, exe = self._fake_exe(tmp_path)
+        os.symlink("python3.11", bindir / "cswap-pin-proxy")
+        monkeypatch.setattr(pp.sys, "executable", str(exe))
+        assert os.readlink(pp._daemon_executable()) == "python3"
+
+    def test_already_renamed_is_kept(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp.sys, "executable", str(tmp_path / "cswap-pin-proxy"))
+        assert pp._daemon_executable() == str(tmp_path / "cswap-pin-proxy")
+
+    def test_unwritable_bin_falls_back(self, tmp_path, monkeypatch):
+        import os
+        from cswap_pin import proxy as pp
+        bindir, exe = self._fake_exe(tmp_path)
+        os.chmod(bindir, 0o500)
+        try:
+            monkeypatch.setattr(pp.sys, "executable", str(exe))
+            assert pp._daemon_executable() == str(exe)
+        finally:
+            os.chmod(bindir, 0o700)
