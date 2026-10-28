@@ -32640,6 +32640,16 @@ class TestDaemonExecutableName:
         monkeypatch.setattr(pp.sys, "executable", str(tmp_path / "cswap-pin-proxy"))
         assert pp._daemon_executable() == str(tmp_path / "cswap-pin-proxy")
 
+    def test_a_reinstall_that_dropped_the_link_remakes_it(self, tmp_path, monkeypatch):
+        import os
+        from cswap_pin import proxy as pp
+        bindir, exe = self._fake_exe(tmp_path)
+        # The holder runs AS the link; a reinstall rebuilt bin/ without it.
+        monkeypatch.setattr(pp.sys, "executable", str(bindir / "cswap-pin-proxy"))
+        got = pp._daemon_executable()
+        assert got == str(bindir / "cswap-pin-proxy")
+        assert os.readlink(got) == "python3"
+
     def test_unwritable_bin_falls_back(self, tmp_path, monkeypatch):
         import os
         from cswap_pin import proxy as pp

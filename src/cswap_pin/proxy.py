@@ -9019,7 +9019,20 @@ def _daemon_executable() -> str:
         return exe
     bindir, base = os.path.split(exe)
     if base == _PROCESS_NAME:
-        return exe  # already running under it: holder -> daemon, daemon -> standby
+        if os.path.exists(exe):
+            return exe  # already running under it: holder -> daemon, daemon -> standby
+        # A REINSTALL REPLACED `bin/` UNDER A RUNNING HOLDER. `uv tool install
+        # --force` rebuilds the venv without this link, so the holder's own
+        # `sys.executable` is gone and every successor spawn raised
+        # FileNotFoundError; on 2026-10-28 that left the port served UNPINNED
+        # until the link was made by hand. Re-make it from the interpreter
+        # the new `bin/` does carry.
+        for real in ("python3", "python"):
+            if os.path.exists(os.path.join(bindir, real)):
+                base = real
+                break
+        else:
+            return exe
     link = os.path.join(bindir, _PROCESS_NAME)
     try:
         if os.readlink(link) == base:
