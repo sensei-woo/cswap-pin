@@ -20461,3 +20461,145 @@ class TestPinStoodDownSwap:
         finally:
             proxy.stop()
             upstream.stop()
+
+class TestPumpBackpressure:
+    """One tunnel's backlog is bounded, and a backed-up tunnel stalls no other.
+
+    MEASURED (an `aws s3 sync` through a blind CONNECT tunnel, sent faster than
+    the hop leg drained): `_PumpLoop` kept reading the source while its peer
+    was backed up, rebuilding the backlog as one bytes object on every read and
+    every partial send. Two tunnels reached 4.15 MB of backlog each, the one
+    pump thread ran 99.5% of a core (86% kernel), and holding the GIL it
+    delayed every other thread ~2.4 s: /health took 1-11 s and Remote Control
+    bridges lost their heartbeats and gave up.
+
+    Every tunnel here is a socketpair into a `_PumpLoop` of its own, with a
+    4 KiB send buffer on the slow side so the peer "stops draining" at once.
+    """
+
+    CEILING = 2 * 1024 * 1024        # the pump's cap is ~1 MiB, plus one read
+    PAYLOAD = (bytes(range(251)) * (8 * 1024 * 1024 // 251 + 1))[:8 * 1024 * 1024]
+
+    @staticmethod
+    def _tunnel(loop):
+        """feed -> [pump: src -> dst] -> far, `far` never reading by itself."""
+        feed, src = socket.socketpair()
+        dst, far = socket.socketpair()
+        for s in (dst, far):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        loop.add(src, dst)
+        return feed, src, dst, far
+
+    @staticmethod
+    def _backlog(loop, dst) -> int:
+        with loop._lock:
+            return len(loop._pending.get(dst, b""))
+
+    def _blast(self, feed, data=None):
+        """Send `data` as fast as the pump takes it; `done` is set when ALL of
+        it has been accepted, which a held-back source never reaches."""
+        done = threading.Event()
+
+        def run():
+            try:
+                feed.sendall(self.PAYLOAD if data is None else data)
+            except OSError:
+                return
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        return done
+
+    def _settle(self, loop, dst, done) -> int:
+        """Peak backlog once it stops growing, or once the feeder finished."""
+        peak = last = -1
+        steady, deadline = time.monotonic(), time.monotonic() + 10
+        while not done.is_set() and time.monotonic() < deadline:
+            n = self._backlog(loop, dst)
+            peak = max(peak, n)
+            if n != last:
+                last, steady = n, time.monotonic()
+            elif n and time.monotonic() - steady > 0.3:
+                break
+            time.sleep(0.01)
+        return max(peak, self._backlog(loop, dst))
+
+    @staticmethod
+    def _close(loop, *socks):
+        loop.release_pairs()
+        for s in socks:
+            s.close()
+
+    def test_a_backed_up_tunnel_keeps_its_backlog_bounded_and_the_rest_fast(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        feed2, in2 = socket.socketpair()
+        out2, sink2 = socket.socketpair()
+        loop.add(in2, out2)
+        done = self._blast(feed)
+        try:
+            peak = self._settle(loop, dst, done)
+            started = time.monotonic()
+            feed2.sendall(b"ping")
+            sink2.settimeout(5)
+            got = sink2.recv(16)
+            round_trip = time.monotonic() - started
+            assert peak <= self.CEILING, (
+                f"{peak} bytes sit in the pump for one backed-up tunnel "
+                f"(ceiling {self.CEILING}): it kept reading its source")
+            assert not done.is_set(), "the source was never held back"
+            assert got == b"ping"
+            assert round_trip < 0.5, (
+                f"a light tunnel's round trip took {round_trip:.2f}s while "
+                f"another was backed up")
+        finally:
+            self._close(loop, feed, far, feed2, sink2, in2, out2)
+
+    def test_a_held_back_source_resumes_and_every_byte_arrives_in_order(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        done = self._blast(feed)
+        try:
+            self._settle(loop, dst, done)
+            assert not done.is_set(), "precondition: the source was held back"
+            got = bytearray()
+            far.settimeout(10)
+            while len(got) < len(self.PAYLOAD):
+                chunk = far.recv(65536)
+                assert chunk, f"the tunnel ended after {len(got)} bytes"
+                got += chunk
+            assert got == self.PAYLOAD
+            assert done.wait(5), "the source never finished: reading never resumed"
+        finally:
+            self._close(loop, feed, far)
+
+    @pytest.mark.parametrize("how", ["source_eof", "released_while_held_back"])
+    def test_a_closed_pair_leaves_no_pending_entry(self, how):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        # Held back needs more than the cap; plain EOF needs a backlog, not a pause.
+        data = None if how == "released_while_held_back" else self.PAYLOAD[:256 * 1024]
+        done = self._blast(feed, data)
+        try:
+            peak = self._settle(loop, dst, done)
+            assert peak > 0, "precondition: the peer is not draining"
+            if how == "source_eof":
+                feed.close()
+            else:
+                assert loop.release_pairs() == 1
+            deadline = time.monotonic() + 5
+            while loop.live_pairs() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert loop.live_pairs() == 0, "precondition: the pair ended"
+            assert not loop._pending, (
+                f"a closed pair left {len(loop._pending)} entr(y/ies) in "
+                f"`_pending`: {[len(v) for v in loop._pending.values()]} bytes")
+        finally:
+            self._close(loop, feed, far)
